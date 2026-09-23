@@ -194,8 +194,10 @@ camera.position.set(22, 16, 30);
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
 controls.dampingFactor = 0.08;
-controls.minDistance = 0.6;
+controls.minDistance = R + 3;
 controls.maxDistance = 80;
+controls.enablePan = false;       // panning only makes sense once we're down at ground level
+controls.screenSpacePanning = false; // pan across the plane perpendicular to camera.up = along the ground
 controls.autoRotate = true;
 controls.autoRotateSpeed = 0.5;
 controls.zoomSpeed = 1.2;
@@ -589,6 +591,8 @@ const BUILDING_COLORS = ['#ff6b6b', '#ffd93d', '#6bcbef', '#b388eb', '#ff9f43', 
 const ROOF_COLORS = ['#d9453b', '#8a4f3a', '#3f6fd1', '#5a3f7a'];
 
 const treeSpots = []; // {dir, scale, kind}
+// Solid things the camera must stay above: {dir, cos (angular footprint), top, cone?}
+const obstacles = [];
 {
   const parts = [];
   for (const city of cities) {
@@ -613,14 +617,17 @@ const treeSpots = []; // {dir, scale, kind}
         const base = new THREE.Matrix4().compose(dir.clone().multiplyScalar(GROUND - 0.01), q, new THREE.Vector3(1, 1, 1));
         const color = pick(BUILDING_COLORS);
         const local = [];
+        let topH, foot;
         if (f > 0.35 || rand() < 0.25) {
           // tower
           const w = rr(0.2, 0.32), d = rr(0.2, 0.32);
           const h = 0.3 + Math.pow(f, 1.6) * rr(1.2, 2.4) + rr(0, 0.3);
           local.push(part(windowBox(w, h, d), color));
+          topH = h + 0.2; foot = Math.hypot(w, d) / 2;
           const top = rand();
           if (top < 0.35) {
             const h2 = rr(0.15, 0.4);
+            topH += h2;
             local.push(part(windowBox(w * 0.65, h2, d * 0.65), color, [0, h, 0]));
             if (rand() < 0.6) local.push(part(plainUV(new THREE.CylinderGeometry(0.008, 0.012, 0.35, 4)), '#f5f1e6', [0, h + h2 + 0.17, 0]));
           } else if (top < 0.55) {
@@ -635,10 +642,12 @@ const treeSpots = []; // {dir, scale, kind}
           const w = rr(0.16, 0.24), d = rr(0.16, 0.24), h = rr(0.12, 0.2);
           local.push(part(windowBox(w, h, d), color));
           const roofH = rr(0.1, 0.16);
+          topH = h + roofH; foot = Math.hypot(w, d) / 2;
           local.push(part(plainUV(new THREE.ConeGeometry(Math.max(w, d) * 0.78, roofH, 4)), pick(ROOF_COLORS),
             [0, h + roofH / 2, 0], [0, Math.PI / 4, 0], [w / Math.max(w, d), 1, d / Math.max(w, d)]));
         }
         for (const p of local) { p.matrix = base.clone().multiply(p.matrix); parts.push(p); }
+        obstacles.push({ dir, cos: Math.cos((foot + 0.05) / R), top: GROUND + topH });
       }
     }
   }
@@ -666,6 +675,7 @@ const mountainDirs = [];
     if (mountainDirs.some((m) => m.angleTo(d) < 0.14)) continue;
     mountainDirs.push(d);
     const H = rr(1.3, 2.4), r = H * rr(0.5, 0.7);
+    obstacles.push({ dir: d, cos: Math.cos(r / (info.r - 0.3)), base: info.r - 0.3, top: info.r - 0.3 + H, cone: r / (info.r - 0.3) });
     const base = new THREE.Matrix4().compose(d.clone().multiplyScalar(info.r - 0.3), surfaceQuat(d, randomDir()), new THREE.Vector3(1, 1, 1));
     const rock = pick(['#b0825a', '#9b7bb8', '#a8745b']);
     parts.push({ ...part(new THREE.ConeGeometry(r, H, 7).translate(0, H / 2, 0), rock), matrix: base.clone() });
@@ -934,7 +944,73 @@ moonPivot.rotation.x = 0.4;
 // ---------------------------------------------------------------------------
 // Interaction: double-click to fly to a spot, reset, auto-spin
 // ---------------------------------------------------------------------------
+// Two camera modes:
+//  - "space":  orbit around the planet centre (world up = +Y)
+//  - "ground": orbit around a point on the surface; camera.up is the local surface normal,
+//              so orbiting keeps you above the horizon and panning slides you across the land.
+// Zooming in from space drops you into ground mode, zooming out far enough takes you back.
+const WORLD_UP = new THREE.Vector3(0, 1, 0);
+const SPACE_ENTER_GROUND = R + 5.5;  // camera distance from centre that switches to ground mode
+const GROUND_EXIT = 10;              // distance from target that switches back to space
+let mode = 'space';
 let flight = null;
+
+function setControlsUp(up) {
+  camera.up.copy(up);
+  // OrbitControls caches the rotation into its "y-up" frame at construction time; refresh it.
+  controls._quat.setFromUnitVectors(camera.up, WORLD_UP);
+  controls._quatInverse.copy(controls._quat).invert();
+}
+function applyMode(m) {
+  mode = m;
+  const ground = m === 'ground';
+  controls.enablePan = ground;
+  controls.minDistance = ground ? 0.35 : R + 3;
+  controls.maxDistance = ground ? GROUND_EXIT + 2 : 80;
+  controls.maxPolarAngle = ground ? Math.PI * 0.47 : Math.PI;
+}
+
+// Highest solid surface (terrain, water, buildings, mountains) along a direction
+function surfaceClearance(d) {
+  let top = Math.max(R + 0.05, groundR(d));
+  for (const o of obstacles) {
+    const c = d.dot(o.dir);
+    if (c < o.cos) continue;
+    const h = o.cone ? o.base + (o.top - o.base) * (1 - Math.acos(Math.min(1, c)) / o.cone) : o.top;
+    top = Math.max(top, h);
+  }
+  return top;
+}
+
+function startFlight(toTarget, toCam, toMode, duration = 1.4, cancelable = false) {
+  flight = {
+    t: 0, duration, toMode, cancelable,
+    fromTarget: controls.target.clone(), toTarget,
+    fromCam: camera.position.clone(), toCam,
+    fromUp: camera.up.clone(),
+    toUp: toMode === 'ground' ? toTarget.clone().normalize() : WORLD_UP.clone(),
+  };
+  applyMode(toMode);
+}
+// pivot height: land, or the sea surface over water
+const pivotR = (d) => Math.max(R, groundR(d));
+const groundPoint = (p) => { const d = p.clone().normalize(); return d.multiplyScalar(pivotR(d)); };
+
+// Swoop from space down to a tilted view of the spot under the camera
+function descend() {
+  const n = camera.position.clone().normalize();
+  const target = groundPoint(n);
+  let fwd = camera.up.clone().addScaledVector(n, -camera.up.dot(n));
+  if (fwd.lengthSq() < 1e-6) fwd = new THREE.Vector3(1, 0, 0).addScaledVector(n, -n.x);
+  fwd.normalize();
+  const cam = target.clone().addScaledVector(n, 3.2).addScaledVector(fwd, -2.6);
+  startFlight(target, cam, 'ground', 1.2);
+}
+function flyHome() {
+  const dir = camera.position.clone().normalize();
+  startFlight(new THREE.Vector3(), dir.multiplyScalar(36), 'space');
+}
+
 const raycaster = new THREE.Raycaster();
 const pointer = new THREE.Vector2();
 renderer.domElement.addEventListener('dblclick', (e) => {
@@ -943,25 +1019,55 @@ renderer.domElement.addEventListener('dblclick', (e) => {
   const hit = raycaster.intersectObjects(scene.children, true)
     .find((h) => h.object.material !== INK && h.object.material !== roadInk && h.object.visible);
   if (!hit) return;
-  const target = hit.point.clone();
-  const offset = camera.position.clone().sub(controls.target).normalize();
-  const outward = target.clone().normalize();
-  const view = offset.lerp(outward, 0.5).normalize().multiplyScalar(3.2);
-  flight = {
-    t: 0,
-    fromTarget: controls.target.clone(), toTarget: target,
-    fromCam: camera.position.clone(), toCam: target.clone().add(view),
-  };
+  const target = groundPoint(hit.point);
+  const n = target.clone().normalize();
+  const back = camera.position.clone().sub(target);
+  back.addScaledVector(n, -back.dot(n));
+  if (back.lengthSq() < 1e-6) back.set(1, 0, 0).addScaledVector(n, -n.x);
+  back.normalize();
+  startFlight(target, target.clone().addScaledVector(n, 2.4).addScaledVector(back, 2.2), 'ground', 1.4, true);
   setSpin(false);
 });
-function flyHome() {
-  flight = {
-    t: 0,
-    fromTarget: controls.target.clone(), toTarget: new THREE.Vector3(),
-    fromCam: camera.position.clone(),
-    toCam: camera.position.clone().normalize().multiplyScalar(36),
-  };
+
+const _q = new THREE.Quaternion(), _off = new THREE.Vector3(), _n = new THREE.Vector3();
+function updateCamera(dt) {
+  if (flight) {
+    flight.t = Math.min(1, flight.t + dt / flight.duration);
+    const k = flight.t < 0.5 ? 4 * flight.t ** 3 : 1 - Math.pow(-2 * flight.t + 2, 3) / 2;
+    controls.target.lerpVectors(flight.fromTarget, flight.toTarget, k);
+    camera.position.lerpVectors(flight.fromCam, flight.toCam, k);
+    setControlsUp(_n.copy(flight.fromUp).lerp(flight.toUp, k).normalize());
+    if (flight.t >= 1) flight = null;
+  }
+
+  controls.update(dt);
+
+  if (!flight) {
+    if (mode === 'ground') {
+      // keep the pivot glued to the ground, carrying the camera along
+      const t = controls.target;
+      _n.copy(t).normalize();
+      const snapped = _n.clone().multiplyScalar(pivotR(_n));
+      camera.position.add(_off.subVectors(snapped, t));
+      t.copy(snapped);
+      // as the pivot travels around the planet, rotate the view with the local "up"
+      _q.setFromUnitVectors(camera.up, _n);
+      _off.subVectors(camera.position, t).applyQuaternion(_q);
+      camera.position.copy(t).add(_off);
+      setControlsUp(_n);
+      if (camera.position.distanceTo(t) > GROUND_EXIT) flyHome();
+    } else if (camera.position.length() < SPACE_ENTER_GROUND) {
+      descend();
+    }
+  }
+
+  // never let the camera sink into the planet, a mountain or a building
+  _n.copy(camera.position).normalize();
+  const minR = surfaceClearance(_n) + 0.15;
+  if (camera.position.length() < minR) camera.position.copy(_n).multiplyScalar(minR);
+  camera.lookAt(controls.target);
 }
+
 const spinBtn = document.getElementById('spin');
 function setSpin(on) {
   controls.autoRotate = on;
@@ -972,7 +1078,7 @@ spinBtn.addEventListener('click', () => setSpin(!controls.autoRotate));
 document.getElementById('reset').addEventListener('click', flyHome);
 const bubble = document.querySelector('.bubble');
 bubble.addEventListener('click', () => bubble.classList.add('hidden'));
-controls.addEventListener('start', () => { flight = null; });
+controls.addEventListener('start', () => { if (flight?.cancelable) flight = null; });
 
 window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;
@@ -1013,21 +1119,14 @@ function animate() {
   }
   moonPivot.rotation.y += dt * 0.03;
 
-  if (flight) {
-    flight.t = Math.min(1, flight.t + dt / 1.4);
-    const k = flight.t < 0.5 ? 4 * flight.t ** 3 : 1 - Math.pow(-2 * flight.t + 2, 3) / 2;
-    controls.target.lerpVectors(flight.fromTarget, flight.toTarget, k);
-    camera.position.lerpVectors(flight.fromCam, flight.toCam, k);
-    if (flight.t >= 1) flight = null;
-  }
-  controls.update(dt);
+  updateCamera(dt);
   renderer.render(scene, camera);
   requestAnimationFrame(animate);
 }
 animate();
 
 // handy for poking around from the dev console
-window.tinyPlanet = { scene, camera, controls, cities, roads };
+window.tinyPlanet = { scene, camera, controls, cities, roads, getMode: () => mode, surfaceClearance };
 </script>
 </body>
 </html>
