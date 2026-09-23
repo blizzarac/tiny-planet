@@ -61,7 +61,10 @@
     font-family: "Comic Sans MS", "Comic Neue", "Trebuchet MS", sans-serif;
     font-size: 14px;
     line-height: 1.4;
+    cursor: pointer;
+    transition: opacity 0.25s, transform 0.25s;
   }
+  .bubble.hidden { opacity: 0; transform: scale(0.8); pointer-events: none; }
   .bubble b { font-family: "Bangers", "Impact", sans-serif; font-weight: normal; letter-spacing: 1px; font-size: 16px; }
   .buttons {
     position: fixed;
@@ -101,7 +104,7 @@
 </head>
 <body>
 <h1 class="title">TINY PLANET!</h1>
-<div class="bubble">
+<div class="bubble" title="Click to dismiss">
   <b>Welcome, giant!</b><br />
   Drag to orbit &middot; scroll / pinch to zoom &middot; right-drag to pan.<br />
   <b>Double-click</b> anything to fly in close.
@@ -967,6 +970,8 @@ function setSpin(on) {
 }
 spinBtn.addEventListener('click', () => setSpin(!controls.autoRotate));
 document.getElementById('reset').addEventListener('click', flyHome);
+const bubble = document.querySelector('.bubble');
+bubble.addEventListener('click', () => bubble.classList.add('hidden'));
 controls.addEventListener('start', () => { flight = null; });
 
 window.addEventListener('resize', () => {
